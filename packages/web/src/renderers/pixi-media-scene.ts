@@ -941,10 +941,22 @@ export async function createPixiMediaScene(
     options.onDisplayChange?.(display);
   };
 
+  const updateMediaSampling = () => {
+    if (!mediaSprite) return;
+    const threshold = options.pixelInspection?.minScale;
+    if (threshold === undefined) return;
+    const source = mediaSprite.texture.source;
+    const mode = viewportScale >= threshold ? "nearest" : "linear";
+    if (source.scaleMode === mode) return;
+    source.scaleMode = mode;
+    source.style.update();
+  };
+
   const applyViewportTransform = () => {
     if (!mediaScene || !baseFit) return;
     const transform = viewport.getTransform();
     viewportScale = baseFit.scale * transform.scale;
+    updateMediaSampling();
     mediaScene.scale.set(viewportScale);
     const box = syncPresentationBox();
     mediaScene.position.set(
@@ -1394,6 +1406,8 @@ export async function createPixiMediaScene(
         const brightness = adjustments.brightness ?? 1;
         const contrast = adjustments.contrast ?? 1;
         const filter = new ColorMatrixFilter();
+        // Preserve the renderer's pixel grid through the adjustment pass.
+        filter.resolution = "inherit";
         filter.brightness(brightness, false);
         filter.contrast(contrast - 1, true);
         if (mediaSprite) mediaSprite.filters = [filter];
@@ -1467,6 +1481,7 @@ export async function createPixiMediaScene(
     },
 
     panViewportBy(dx, dy) {
+      if (viewport.getTransform().locked) return;
       const before = viewport.getTransform();
       viewport.panBy(dx, dy);
       const after = viewport.getTransform();
@@ -1477,7 +1492,7 @@ export async function createPixiMediaScene(
     },
 
     zoomViewportAt(point, factor) {
-      if (!baseFit) return;
+      if (!baseFit || viewport.getTransform().locked) return;
       viewport.zoomAt(
         { x: point.x - baseFit.x, y: point.y - baseFit.y },
         factor,
@@ -1493,7 +1508,7 @@ export async function createPixiMediaScene(
     },
 
     zoomViewportFromWheel(point, deltaY) {
-      if (!baseFit) return;
+      if (!baseFit || viewport.getTransform().locked) return;
       viewport.zoomFromWheel(
         { x: point.x - baseFit.x, y: point.y - baseFit.y },
         deltaY,
@@ -2721,11 +2736,24 @@ export async function createPixiMediaScene(
       });
       detached.width = mediaWidth;
       detached.height = mediaHeight;
+      const source = sprite.texture.source;
+      const displayScaleMode = source.scaleMode;
       try {
+        // Capture retains its baseline sampling even when pixel inspection
+        // changes display sampling. Extraction is synchronous, so the shared
+        // source can be restored before another frame draws.
+        if (displayScaleMode !== "linear") {
+          source.scaleMode = "linear";
+          source.style.update();
+        }
         return app.renderer.extract.canvas(
           detached,
         ) as unknown as HTMLCanvasElement;
       } finally {
+        if (displayScaleMode !== "linear") {
+          source.scaleMode = displayScaleMode;
+          source.style.update();
+        }
         detached.destroy();
       }
     };
@@ -2742,6 +2770,7 @@ export async function createPixiMediaScene(
         // takes the new size's scale while still drawing the previous size's
         // quad, so a preview-sized frame paints the media oversized.
         sprite.texture = new Texture({ dynamic: true, source: externalSource });
+        updateMediaSampling();
         sizeMediaSprite();
         return externalSource;
       },
