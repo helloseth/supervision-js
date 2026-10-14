@@ -219,7 +219,10 @@ function createMainThreadMaskFramePreparer(
         return idMaskFrame;
       }
 
-      const compositedFrame = compositeMaskFrame(job.instructions);
+      const compositedFrame = compositeMaskFrame(
+        job.instructions,
+        job.displayWidth,
+      );
 
       if (!compositedFrame && !regionMaskCoverage) {
         return undefined;
@@ -314,6 +317,7 @@ function createPreparedIdMaskFrame(
     regionMaskCoverage,
     sourceWidth: frame.sourceWidth,
     strokePalette: frame.strokePalette,
+    strokeAlignments: frame.strokeAlignments,
     strokeWidths: frame.strokeWidths,
     width: frame.width,
   };
@@ -503,6 +507,7 @@ function createPreparedFrameFromWorkerResponse(
       screenStrokes: message.screenStrokes,
       sourceWidth: message.sourceWidth,
       strokePalette: message.strokePalette,
+      strokeAlignments: message.strokeAlignments,
       strokeWidths: message.strokeWidths,
       width: message.width,
     };
