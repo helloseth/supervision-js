@@ -569,6 +569,14 @@ still returns the presented source pixels. Brightness/contrast adjustments retai
 the configured renderer resolution, including on Retina displays. Omit the option for smooth sampling
 at every zoom.
 
+`renderer.setDisplayAdjustments({ brightness, contrast, gamma, autoContrast })`
+changes only media display. Brightness, contrast and gamma default to `1`; gamma
+above `1` brightens midtones. For still images, `autoContrast: true` applies
+Contrast Limited Adaptive Histogram Equalization (CLAHE) instead of manual
+contrast. Brightness and gamma remain active. Auto contrast is ignored for video;
+passing an empty object restores the unadjusted display. Source pixels and
+annotation styles are unchanged.
+
 `renderer.setViewportTransform({ scale, x, y })` applies an exact transform in
 natural media pixels and container-relative CSS pixels. Explicit updates work
 while the viewport is locked and can restore scales outside the ordinary gesture
