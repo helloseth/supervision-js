@@ -37,6 +37,7 @@ export {
   MediaSourceStatus,
 } from "supervision-js-core";
 export type {
+  AnnotationAntialiasing,
   MediaFrameDiagnostics,
   MediaFrameRenderTimings,
   MediaRendererDiagnosticsOptions,
@@ -225,6 +226,7 @@ export interface MediaRenderer extends MediaRendererStateController {
    * presented while the encoder runs cannot change the result.
    */
   captureFrame(options?: MediaFrameCaptureOptions): Promise<MediaFrameCapture>;
+  /** Replaces selection; an ordered `detectionIds` list returns its last valid pick. */
   setSelectedDetection(
     selection: DetectionSelectionOptions | null,
   ): DetectionPickResult | null;
@@ -240,12 +242,12 @@ export interface MediaRenderer extends MediaRendererStateController {
    */
   getActiveDepth?(): ActiveDepthMap | null;
   /**
-   * Explicit renders issued under the render-on-change policy, which only a
-   * media source that pushes presented frames runs under: the count moves when
-   * something on screen changed, so a paused, untouched renderer holds it
-   * still. It is `null` when the renderer pulls samples instead, because Pixi's
-   * ticker then paints every animation frame and no count describes that, so a
-   * `null` here is an answer rather than a failure.
+   * Explicit renders issued under the render-on-change policy, which a media
+   * source that pushes presented frames and a still image run under: the count
+   * moves when something on screen changed, so a paused, untouched renderer
+   * holds it still. It is `null` when the renderer pulls samples from media
+   * that plays, because Pixi's ticker then paints every animation frame and no
+   * count describes that, so a `null` here is an answer rather than a failure.
    */
   getRenderCount(): number | null;
   /**

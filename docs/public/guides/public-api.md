@@ -118,6 +118,16 @@ annotation visualization. An annotation renderer consumes semantic detections
 and contributes to the renderer-owned scene. The built-ins retain the
 established draw order and backend paths for masks, boxes, vectors, and labels.
 
+`MediaRendererPresentation.annotationAntialiasing` enables smoothing for all
+annotation edges, including focus and interaction, without filtering video
+frames. Use `true` for FXAA at output density or `2` for FXAA captured at twice
+that density in each dimension. It smooths label
+backgrounds while keeping text sharp. Separated label runs share captures;
+overlaps split captures to preserve blending and draw order. It defaults to
+`false` and can change in an existing
+session. See
+[Presentation Styles](presentation-styles.md#smooth-annotation-edges).
+
 ```ts
 import { annotationRenderers, BaseBoxStyle, BaseLabelStyle } from "supervision";
 
@@ -200,7 +210,9 @@ not the first thing most users should reach for:
   `display` to size the decode to the box the frames are painted into; without
   it they decode at the source's full resolution however small that box is.
   Under this source the renderer also answers `getRenderCount()` and
-  `getPreparedAnnotationWindow()`, which report `null` for pulled media;
+  `getPreparedAnnotationWindow()`, which report `null` for pulled media that
+  plays. A still image renders on change too, so it answers
+  `getRenderCount()`;
 - `DetectionFrameSource` for caller-owned range loading. `loadFrames` receives
   optional `DetectionFrameLoadOptions`; a source that returns its own frames
   unchanged can ignore it, while a source that flattens child frames uses
@@ -382,6 +394,22 @@ fills stay below vector geometry. Keypoints and edges retain priority within
 the chosen detection. Leave this option unset for the default smallest-object
 policy or when accompanying rectangles are independent box targets.
 
+Enable `interaction.multiSelect` for Shift-click selection toggles and
+drag-selection from empty space. `onSelectionChange` reports the full ordered
+selection; `onSelect` reports its primary pick. Shift-clicking a detection in
+Select mode changes selection without starting a move. Shift-click and the
+secondary button still delete an editable polygon/polyline vertex when its
+selected vertex handle is hit; active creation tools keep their gesture priority.
+
+Restore host-owned selections with
+`session.renderer.setSelectedDetection({ detectionIds: selectedIds })`.
+Duplicate ids are ignored, missing or hidden detections are excluded, and the
+last valid id is the primary pick returned by the method. An empty list clears
+selection. `detectionIds` takes precedence over `detectionId` or
+`detectionIndex` when supplied together; singular selectors continue to select
+one detection. Use the full list rather than restoring only the primary pick
+after a refresh or application state update.
+
 Synchronizing the same creation tool is idempotent: `setCreationTool(null)`
 keeps a selection drag alive when the engine is already in Select mode. To
 abort a gesture explicitly, call `engine.cancel()`.
@@ -550,6 +578,14 @@ only media display: annotations keep their configured styles, and `captureFrame(
 still returns the presented source pixels. Brightness/contrast adjustments retain
 the configured renderer resolution, including on Retina displays. Omit the option for smooth sampling
 at every zoom.
+
+`renderer.setDisplayAdjustments({ brightness, contrast, gamma, autoContrast })`
+changes only media display. Brightness, contrast and gamma default to `1`; gamma
+above `1` brightens midtones. For still images, `autoContrast: true` applies
+Contrast Limited Adaptive Histogram Equalization (CLAHE) instead of manual
+contrast. Brightness and gamma remain active. Auto contrast is ignored for video;
+passing an empty object restores the unadjusted display. Source pixels and
+annotation styles are unchanged.
 
 `renderer.setViewportTransform({ scale, x, y })` applies an exact transform in
 natural media pixels and container-relative CSS pixels. Explicit updates work

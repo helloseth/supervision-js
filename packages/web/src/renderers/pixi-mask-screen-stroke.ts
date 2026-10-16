@@ -1,5 +1,5 @@
 import type { Graphics } from "pixi.js";
-import type { MaskStrokeStyle } from "supervision-js-core";
+import { StrokeAlignment, type MaskStrokeStyle } from "supervision-js-core";
 import type {
   PreparedIdMaskFrame,
   PreparedMaskFrame,
@@ -50,7 +50,7 @@ export function createPixiMaskScreenStrokeRenderer(options: {
         strokes = overrides.flatMap(
           ({ detectionIndex, stroke }): PreparedMaskScreenStroke[] => {
             if (
-              stroke?.widthUnit !== "screen" ||
+              stroke?.widthUnit === undefined ||
               stroke.width <= 0 ||
               stroke.alpha <= 0
             )
@@ -81,22 +81,44 @@ export function createPixiMaskScreenStrokeRenderer(options: {
         hide();
         return;
       }
-      const signature = `${viewportScale}:${strokes.map(({ detectionIndex, width, color, alpha }) => `${detectionIndex}:${width}:${color}:${alpha}`).join(";")}`;
+      const signature = `${viewportScale}:${strokes.map(({ detectionIndex, width, widthUnit, alignment, color, alpha }) => `${detectionIndex}:${width}:${widthUnit}:${alignment}:${color}:${alpha}`).join(";")}`;
       if (lastFrame !== frame || lastSignature !== signature) {
         display.clear();
         const scaleX = options.mediaWidth / frame.width;
         const scaleY = options.mediaHeight / frame.height;
         for (const stroke of strokes) {
-          for (const path of stroke.paths) {
-            if (path.length < 6) continue;
-            display.moveTo(path[0]! * scaleX, path[1]! * scaleY);
-            for (let index = 2; index < path.length; index += 2)
-              display.lineTo(path[index]! * scaleX, path[index + 1]! * scaleY);
-            display.closePath();
+          for (const { paths, alignment } of resolveContourGroups(stroke)) {
+            for (const path of paths) {
+              if (path.length < 6) continue;
+              display.moveTo(path[0]! * scaleX, path[1]! * scaleY);
+              for (let index = 2; index < path.length; index += 2)
+                display.lineTo(
+                  path[index]! * scaleX,
+                  path[index + 1]! * scaleY,
+                );
+              display.closePath();
+            }
+            display.stroke(
+              resolvePixiStroke(
+                {
+                  ...stroke,
+                  alignment,
+                  width:
+                    stroke.widthUnit === "mask"
+                      ? (2 *
+                          stroke.width *
+                          options.mediaWidth *
+                          viewportScale) /
+                        (frame.kind === PreparedMaskFrameKind.IdMask
+                          ? frame.sourceWidth
+                          : frame.width)
+                      : stroke.width,
+                  join: "round",
+                },
+                viewportScale,
+              ),
+            );
           }
-          display.stroke(
-            resolvePixiStroke({ ...stroke, join: "round" }, viewportScale),
-          );
         }
         lastFrame = frame;
         lastSignature = signature;
@@ -104,4 +126,41 @@ export function createPixiMaskScreenStrokeRenderer(options: {
       display.visible = true;
     },
   };
+}
+
+function resolveContourGroups(stroke: PreparedMaskScreenStroke) {
+  if (
+    stroke.alignment === undefined ||
+    stroke.alignment === StrokeAlignment.Center
+  ) {
+    return [{ paths: stroke.paths, alignment: stroke.alignment }];
+  }
+
+  const outer: Float32Array<ArrayBuffer>[] = [];
+  const holes: Float32Array<ArrayBuffer>[] = [];
+  // Pixi aligns each contour to its enclosed area. Hole alignment must reverse
+  // so Inside and Outside remain relative to the mask's foreground pixels.
+  for (const path of stroke.paths) {
+    let area = 0;
+    for (
+      let index = 0, previous = path.length - 2;
+      index < path.length;
+      index += 2
+    ) {
+      area +=
+        path[previous]! * path[index + 1]! - path[index]! * path[previous + 1]!;
+      previous = index;
+    }
+    (area < 0 ? holes : outer).push(path);
+  }
+  return [
+    { paths: outer, alignment: stroke.alignment },
+    {
+      paths: holes,
+      alignment:
+        stroke.alignment === StrokeAlignment.Outside
+          ? StrokeAlignment.Inside
+          : StrokeAlignment.Outside,
+    },
+  ].filter(({ paths }) => paths.length > 0);
 }

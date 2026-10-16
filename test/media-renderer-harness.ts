@@ -111,8 +111,11 @@ const mockState = vi.hoisted(() => {
       visible: boolean;
       width: number;
     }>,
+    render: vi.fn(),
     tickerAdd: vi.fn(),
     tickerRemove: vi.fn(),
+    tickerStart: vi.fn(),
+    tickerStop: vi.fn(),
     textureDestroy: vi.fn(),
     textureOptions: [] as unknown[],
     textureUpdate: vi.fn(),
@@ -194,15 +197,34 @@ vi.mock("pixi.js", () => {
   class Application {
     canvas = {
       addEventListener: pixiMock.canvasAddEventListener,
+      height: 360,
       removeEventListener: pixiMock.canvasRemoveEventListener,
       style: {},
+      width: 640,
     };
-    renderer = { name: "webgl", resize: pixiMock.rendererResize };
     screen = { height: 360, width: 640 };
+    renderer = {
+      name: "webgl",
+      resolution: 1,
+      screen: this.screen,
+      resize: (width: number, height: number, resolution: number) => {
+        Object.assign(this.screen, { width, height });
+        this.renderer.resolution = resolution;
+        this.canvas.width = Math.round(width * resolution);
+        this.canvas.height = Math.round(height * resolution);
+        pixiMock.rendererResize.call(this.renderer, width, height, resolution);
+      },
+    };
     stage = { addChild: pixiMock.stageAddChild };
-    ticker = { add: pixiMock.tickerAdd, remove: pixiMock.tickerRemove };
+    ticker = {
+      add: pixiMock.tickerAdd,
+      remove: pixiMock.tickerRemove,
+      start: pixiMock.tickerStart,
+      stop: pixiMock.tickerStop,
+    };
     destroy = pixiMock.appDestroy;
     init = pixiMock.appInit;
+    render = pixiMock.render;
 
     constructor() {
       pixiMock.canvasInstances.push(this.canvas);
@@ -292,6 +314,10 @@ vi.mock("pixi.js", () => {
       }
 
       return children[0];
+    }
+
+    removeChildren() {
+      return this.children.splice(0);
     }
   }
 
@@ -653,8 +679,11 @@ export function resetMocks() {
   pixiMock.rendererResize.mockClear();
   pixiMock.stageAddChild.mockClear();
   pixiMock.spriteInstances.length = 0;
+  pixiMock.render.mockClear();
   pixiMock.tickerAdd.mockClear();
   pixiMock.tickerRemove.mockClear();
+  pixiMock.tickerStart.mockClear();
+  pixiMock.tickerStop.mockClear();
   pixiMock.textureDestroy.mockClear();
   pixiMock.textureOptions.length = 0;
   pixiMock.textureUpdate.mockClear();

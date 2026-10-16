@@ -179,7 +179,8 @@ export interface PixiMaskLayer {
   ): PixiActiveRegionMaskCoverage | null;
   setPlaybackActive(active: boolean): void;
   setTimelineContext(context: PreparedRenderTimelineContext): void;
-  setRasterDisplay(display: IdMaskDisplayBox): void;
+  setRasterDisplay(display: IdMaskDisplayBox, resolutionScale?: number): void;
+  setViewportScale(scale: number): void;
   setMaskStyle(maskStyle: MaskStyle | null | undefined): void;
   setMaskHaloStyle(maskHaloStyle: MaskHaloStyle | null | undefined): void;
   /**
@@ -281,7 +282,10 @@ export function createPixiMaskLayer(options: {
   const haloTextures = new Map<string, PixiTexture>();
   const regionMaskTextures = new Map<string, Map<number, PixiTexture>>();
   const maskFrameOptions = options.renderPreparation?.maskFrame;
+  const capsRasterToDisplay = maskFrameOptions?.display !== undefined;
   let rasterDisplay = maskFrameOptions?.display;
+  let rasterResolutionScale = 1;
+  let strokeViewportScale: number | undefined;
   const preparedRenderWindow = createPreparedRenderWindow({
     artifactKind: options.artifactKind,
     detectionTimeline: options.detectionTimeline,
@@ -306,6 +310,7 @@ export function createPixiMaskLayer(options: {
     resolveInstructions: options.resolveInstructions,
     resolveMaxRasterWidth,
     resolveMaskFrameBackingBytes,
+    resolveMaskDisplayWidth,
   });
 
   return {
@@ -469,14 +474,24 @@ export function createPixiMaskLayer(options: {
       preparedRenderWindow.setPlaybackActive(active);
     },
 
-    setRasterDisplay(display) {
-      if (!rasterDisplay || isDestroyed) return;
+    setRasterDisplay(display, resolutionScale = 1) {
+      if (isDestroyed) return;
       const previousWidth = resolveMaxRasterWidth();
       rasterDisplay = display;
+      rasterResolutionScale = resolutionScale;
+      idMaskRenderer?.setStrokePixelRatio(
+        resolveDisplayPixelRatio(display) * resolutionScale,
+      );
       const nextWidth = resolveMaxRasterWidth();
       if (mediaWidth > 0 && previousWidth !== nextWidth) {
         preparedRenderWindow.invalidateRasterSize();
       }
+    },
+
+    setViewportScale(scale) {
+      if (isDestroyed || scale <= 0 || scale === strokeViewportScale) return;
+      strokeViewportScale = scale;
+      preparedRenderWindow.invalidateMaskDisplayWidth();
     },
 
     setTimelineContext(context) {
@@ -599,10 +614,20 @@ export function createPixiMaskLayer(options: {
     return texture;
   }
 
-  /**
-   * The widest raster the picture can show. Polygon frames rasterize geometry
-   * at a size of their own choosing, so this sizes mask frames only.
-   */
+  function resolveMaskDisplayWidth() {
+    if (strokeViewportScale !== undefined && mediaWidth > 0) {
+      return mediaWidth * strokeViewportScale;
+    }
+    const display = rasterDisplay;
+    if (!display || mediaWidth <= 0 || mediaHeight <= 0) return undefined;
+    const fit = Math.min(
+      display.boxWidth / mediaWidth,
+      display.boxHeight / mediaHeight,
+    );
+    return fit > 0 ? mediaWidth * fit : undefined;
+  }
+
+  /** Mask detail follows the annotation capture density. */
   function resolveMaxRasterWidth() {
     const display = rasterDisplay;
     const artifactKind =
@@ -610,6 +635,7 @@ export function createPixiMaskLayer(options: {
 
     if (
       !display ||
+      !capsRasterToDisplay ||
       artifactKind !== RenderPreparationArtifactKind.MaskFrame ||
       mediaWidth <= 0 ||
       mediaHeight <= 0
@@ -624,7 +650,9 @@ export function createPixiMaskLayer(options: {
     const pixelRatio = resolveDisplayPixelRatio(display);
 
     return fit > 0 && pixelRatio > 0
-      ? alignRasterWidth(Math.ceil(mediaWidth * fit * pixelRatio))
+      ? alignRasterWidth(
+          Math.ceil(mediaWidth * fit * pixelRatio * rasterResolutionScale),
+        )
       : undefined;
   }
 
@@ -733,7 +761,13 @@ export function createPixiMaskLayer(options: {
     }
 
     maskSprite.visible = false;
-    idMaskRenderer.render(maskFrame, texture);
+    idMaskRenderer.render(
+      maskFrame,
+      texture,
+      rasterDisplay
+        ? resolveDisplayPixelRatio(rasterDisplay) * rasterResolutionScale
+        : 1,
+    );
   }
 
   function hideFill() {

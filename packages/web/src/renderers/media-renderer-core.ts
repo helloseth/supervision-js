@@ -162,6 +162,7 @@ export async function createMediaRendererCore(
       ...presentation,
     });
   let currentPresentation = resolvePresentation({
+    annotationAntialiasing: options.annotationAntialiasing,
     annotationOverlayStyle: options.annotationOverlayStyle,
     backgroundColor: options.backgroundColor,
     boxStyle: options.boxStyle,
@@ -1288,6 +1289,7 @@ export async function createMediaRendererCore(
     const mediaDimensions = runtimeState.recordMediaMetadata(metadata);
     mediaSize = mediaDimensions;
     mediaScene = await providers.createScene({
+      annotationAntialiasing: currentPresentation.annotationAntialiasing,
       annotationOverlayStyle: currentPresentation.annotationOverlayStyle,
       backgroundColor: currentPresentation.backgroundColor,
       boxStyle: currentPresentation.boxStyle,
@@ -1334,6 +1336,9 @@ export async function createMediaRendererCore(
       polygonStyle: currentPresentation.polygonStyle,
       polylineStyle: currentPresentation.polylineStyle,
       presentedFrames: protectedPresentedFrames?.source,
+      // A source with no duration, such as a still image, has one frame to
+      // show and nothing to play.
+      stillFrame: metadata.duration === 0,
       regionRenderers: resolveRegionRenderers(currentPresentation),
       heatmapRenderers: resolveHeatmapRenderers(currentPresentation),
       depthRenderers: resolveDepthRenderers(currentPresentation),

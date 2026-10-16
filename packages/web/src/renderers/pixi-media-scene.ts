@@ -15,6 +15,7 @@ import {
   type OrientedBoxStyle,
   type PercentageBarStyle,
   type PolygonStyle,
+  type PreviewOverlayData,
   type RegionAnnotationRenderer,
   type RegionRendererTarget,
   type ShapeStyle,
@@ -58,6 +59,7 @@ import type {
   PresentedVideoFrame,
 } from "./presented-frame-channel";
 import { createSceneRenderScheduler } from "./scene-render-scheduler";
+import { createPixiMediaInspectionFilter } from "./pixi-media-inspection-filter";
 import type { SceneRenderSignature } from "./scene-render-scheduler";
 import { createPreparedAnnotationWindow } from "./prepared-annotation-window";
 import {
@@ -69,7 +71,10 @@ import { queryMaxTextureSize } from "./depth-textures";
 import { createPixiDepthLayer } from "./pixi-depth-layer";
 import { createPixiHeatmapLayer } from "./pixi-heatmap-layer";
 import { installPixiBatchTextureBindings } from "./pixi-batch-texture-bindings";
+import { installPixiFilterBindings } from "./pixi-filter-bindings";
 import { createPixiFocusLayer } from "./pixi-focus-layer";
+import { createPixiAnnotationAntialiasLayer } from "./pixi-annotation-antialias-layer";
+import { resolvePixiAnnotationAntialiasResolution } from "./pixi-annotation-antialias";
 import { createPixiInteractionLayer } from "./pixi-interaction-layer";
 import { createPixiInteractionPresentationLayer } from "./pixi-interaction-presentation-layer";
 import { createPixiLabelLayer } from "./pixi-label-layer";
@@ -91,11 +96,11 @@ import { createPixiAnnotationOverlayLayer } from "./pixi-annotation-overlay-laye
 import {
   AnnotationGestureStateKind,
   MediaInteractionMode,
+  type AnnotationEditingState,
 } from "supervision-js-core";
 import {
   createPixiSceneLayerSlot,
   PixiSceneLayerKind,
-  syncPixiSceneLayerChildren,
 } from "./pixi-scene-layer-slot";
 import { calculatePixiSceneFit } from "./pixi-scene-fit";
 import type {
@@ -127,6 +132,7 @@ const STATIC_FOCUS_SETTLE_MS = 10_000;
 
 /** The presentation fields a render answers to that no renderer kind owns. */
 const RENDERED_PRESENTATION_TAIL = [
+  "annotationAntialiasing",
   "annotationOverlayStyle",
   "backgroundColor",
   "focusStyle",
@@ -234,6 +240,11 @@ export interface MediaCompositorOptions {
  * sample it wants, hands it to `presentSample`, and Pixi's ticker paints the
  * scene every frame.
  *
+ * A still frame is pulled once and then renders on change the way push
+ * presentation does, with the sample it presents as one more change. The
+ * ticker runs only while a looping GIF region or a loading spinner is on the
+ * frame.
+ *
  * Push presentation engages when the opened source carries a presented-frame
  * channel. The producer then decides which frame is on screen and announces it,
  * so the ticker paints nothing and every render is an explicit answer to a
@@ -289,9 +300,29 @@ export async function createPixiMediaScene(
   const maxTextureSize = () =>
     (maxTextureSide ??= queryMaxTextureSize(app.renderer));
   const frameChannel = options.presentedFrames;
+  /**
+   * A still frame has nothing to play, so it renders on change exactly as push
+   * presentation does. The ticker runs only while something on the frame
+   * animates by the clock.
+   */
+  const stillFrame = frameChannel === undefined && options.stillFrame === true;
+  const rendersOnChange = frameChannel !== undefined || stillFrame;
+  let stillFrameTickerRunning = false;
+  /** The content of the `previewOverlay` answer the overlay on screen drew. */
+  let drawnPreviewOverlayContent: number | null = null;
+  /** The editing state the overlay on screen was drawn from. */
+  let drawnEditingState: AnnotationEditingState | undefined;
   let currentFocusStyle: FocusStyle | null = options.focusStyle ?? null;
   let currentLabelStyle: LabelStyle | null = options.labelStyle ?? null;
   let currentMaskStyle: MaskStyle | null = options.maskStyle ?? null;
+  let annotationAntialiasing = options.annotationAntialiasing ?? false;
+  let annotationAntialiasResolution = 1;
+  const annotationAntialiasLayer = createPixiAnnotationAntialiasLayer({
+    Container,
+    Filter,
+    defaultFilterVert,
+    getEnabled: () => Boolean(annotationAntialiasing),
+  });
   let currentMaskHaloStyle: MaskHaloStyle | null =
     options.maskHaloStyle ?? null;
   let currentBoxCornerStyle: BoxCornerStyle | null =
@@ -323,6 +354,10 @@ export async function createPixiMediaScene(
   let isScrubbing = false;
   let displayBrightness = 1;
   let displayContrast = 1;
+  let displayGamma = 1;
+  let displayAutoContrast = false;
+  let inspectionFilter:
+    ReturnType<typeof createPixiMediaInspectionFilter> | undefined;
   let viewportScale = 1;
   let hasPresentedSample = false;
   let mediaHeight = 0;
@@ -416,6 +451,7 @@ export async function createPixiMediaScene(
         !resolveAnnotationStyleState(detection, currentVisibility).hidden,
       // A partial heatmap changes pixels before the all-ready token changes.
       onPreparedWindowChange: () => redrawAnnotationsNow(true),
+      onTextureRelease: (texture) => focusLayer?.releaseMaskTexture(texture),
       prepareTexture: (texture) => app.renderer.prepare.upload(texture),
       renderPreparation: options.renderPreparation,
       renderers: currentHeatmapRenderers,
@@ -477,6 +513,7 @@ export async function createPixiMediaScene(
           resolveContextState,
         })
       : undefined;
+  polygonLayer?.setPlaybackActive(isPlaybackActive);
   const vectorLayer = createPixiVectorLayer({
     container: retainedGeometry,
     Container,
@@ -506,6 +543,9 @@ export async function createPixiMediaScene(
     Texture,
     UniformGroup,
     detectionTimeline: annotationDetectionTimeline,
+    getAnnotationAntialiasing: () => Boolean(annotationAntialiasing),
+    getAntialiasResolution: () => annotationAntialiasResolution,
+    getViewportBounds: resolveViewportBounds,
     getActiveRegionMaskCoverage: (detectionFrameTime) =>
       maskLayer?.getActiveRegionMaskCoverage(detectionFrameTime) ?? null,
     // Under GPU compositing the decoded frame lands in a texture the
@@ -569,13 +609,14 @@ export async function createPixiMediaScene(
         Text,
         detectionTimeline: annotationDetectionTimeline,
         labelStyle: options.labelStyle,
+        getRenderedBoxes: () => boxLayer.getRenderedBoxes(),
         resolveContextState: resolveLabelContextState,
       })
     : undefined;
 
   await app.init({
     autoDensity: true,
-    autoStart: frameChannel === undefined,
+    autoStart: !rendersOnChange,
     backgroundColor: options.backgroundColor ?? 0x111111,
     /* Only the video-engine media path supplies a presented-frame channel, so
      * which reader opens the clip is also what decides which backend draws. */
@@ -586,6 +627,7 @@ export async function createPixiMediaScene(
     pixi,
     app.renderer,
   );
+  const destroyFilterBindings = installPixiFilterBindings(pixi, app.renderer);
 
   const rendererCanvas = app.canvas;
   rendererCanvas.style.display = "block";
@@ -601,7 +643,10 @@ export async function createPixiMediaScene(
     throw new Error("Unable to create staging canvas context.");
   }
 
-  const renderScheduler = createSceneRenderScheduler(() => app.render());
+  const renderScheduler = createSceneRenderScheduler(() => {
+    app.render();
+    syncStillFrameTicker();
+  });
   const maskBrushPreview = options.maskBrush
     ? createPixiMaskBrushPreview({
         CanvasSource,
@@ -610,7 +655,7 @@ export async function createPixiMediaScene(
         Sprite,
         Texture,
         preview: options.maskBrush,
-        onInvalidate: frameChannel ? renderNow : undefined,
+        onInvalidate: rendersOnChange ? renderNow : undefined,
       })
     : undefined;
   let appliedPresentation: MediaRendererPresentation | undefined;
@@ -634,6 +679,10 @@ export async function createPixiMediaScene(
   const interactionSlot = createPixiSceneLayerSlot(
     PixiSceneLayerKind.Interaction,
   );
+  const interactionLabelSlot = createPixiSceneLayerSlot(
+    PixiSceneLayerKind.Label,
+    interactionSlot.order,
+  );
   const handleSlot = createPixiSceneLayerSlot(PixiSceneLayerKind.Handle);
   const labelSlot = createPixiSceneLayerSlot(PixiSceneLayerKind.Label);
   const layerSlots = [
@@ -648,6 +697,7 @@ export async function createPixiMediaScene(
     previewSlot,
     handleSlot,
     interactionSlot,
+    interactionLabelSlot,
     labelSlot,
   ];
   const viewport = createViewportController({ scale: 1 });
@@ -791,6 +841,17 @@ export async function createPixiMediaScene(
       labelLayer?.drawFrame(currentMediaTime, viewportScale);
       renderNow();
     }
+
+    // With no ticker to pick it up, an edit the host drives itself, such as a
+    // cancel or a commit, reaches the screen through this notification. A
+    // pointer gesture draws and renders its own state before the microtask
+    // runs, which then finds nothing left to draw or render.
+    if (rendersOnChange) {
+      queueMicrotask(() => {
+        if (isDestroyed || isPresenting) return;
+        renderOnChange();
+      });
+    }
   });
   const handleKeyDown = (event: KeyboardEvent) => {
     if (event.key === "Tab" && interactionLayer) {
@@ -818,13 +879,18 @@ export async function createPixiMediaScene(
   }
   let focusLayer = options.focusStyle
     ? createPixiFocusLayer({
+        AlphaMask,
         Container,
         Graphics,
         ImageSource,
         Mesh,
         MeshGeometry,
+        Rectangle,
         Shader,
         UniformGroup,
+        getHeatmapRenderers: () => currentHeatmapRenderers,
+        getAnnotationAntialiasing: () => Boolean(annotationAntialiasing),
+        getViewportBounds: resolveViewportBounds,
         focusStyle: options.focusStyle,
         isDetectionVisible: (detection) =>
           !resolveAnnotationStyleState(detection, currentVisibility).hidden,
@@ -836,7 +902,13 @@ export async function createPixiMediaScene(
   const collectFrameTimings = options.diagnostics?.frameTimings === true;
 
   const syncSceneChildren = () => {
-    syncPixiSceneLayerChildren(mediaScene, layerSlots);
+    labelLayer?.setBackgroundAntialiasFilter(
+      annotationAntialiasLayer.getFxaaFilter(),
+    );
+    interactionPresentationLayer?.setBackgroundAntialiasFilter(
+      annotationAntialiasLayer.getFxaaFilter(),
+    );
+    annotationAntialiasLayer.sync(mediaScene, layerSlots);
   };
 
   const updateMediaSceneFit = () => {
@@ -918,8 +990,30 @@ export async function createPixiMediaScene(
     rendererCanvas.style.left = `${next.left}px`;
     rendererCanvas.style.top = `${next.top}px`;
     app.renderer.resize(next.width, next.height, presentationResolution);
+    syncAnnotationAntialiasResolution();
     return presentationBox;
   };
+
+  const syncAnnotationAntialiasResolution = () => {
+    annotationAntialiasResolution = resolvePixiAnnotationAntialiasResolution(
+      presentationResolution,
+      containerSize,
+      maxTextureSize(),
+      annotationAntialiasing === 2 ? 2 : 1,
+    );
+    annotationAntialiasLayer.setResolution(annotationAntialiasResolution);
+    regionLayer.setAntialiasResolution(annotationAntialiasResolution);
+    syncMaskRasterDisplay();
+  };
+
+  function syncMaskRasterDisplay() {
+    if (!rasterDisplay) return;
+    const scale = annotationAntialiasing
+      ? annotationAntialiasResolution / presentationResolution
+      : 1;
+    maskLayer?.setRasterDisplay(rasterDisplay, scale);
+    polygonLayer?.setRasterDisplay(rasterDisplay, scale);
+  }
 
   const syncDisplaySizing = () => {
     if (!baseFit || mediaWidth <= 0 || mediaHeight <= 0) return;
@@ -938,7 +1032,7 @@ export async function createPixiMediaScene(
       return;
     }
     rasterDisplay = display;
-    maskLayer?.setRasterDisplay(display);
+    syncMaskRasterDisplay();
     options.onDisplayChange?.(display);
   };
 
@@ -957,6 +1051,8 @@ export async function createPixiMediaScene(
     if (!mediaScene || !baseFit) return;
     const transform = viewport.getTransform();
     viewportScale = baseFit.scale * transform.scale;
+    maskLayer?.setViewportScale(viewportScale);
+    polygonLayer?.setViewportScale(viewportScale);
     updateMediaSampling();
     mediaScene.scale.set(viewportScale);
     const box = syncPresentationBox();
@@ -964,8 +1060,20 @@ export async function createPixiMediaScene(
       baseFit.x + transform.x - box.left,
       baseFit.y + transform.y - box.top,
     );
+    focusLayer?.syncViewportBounds();
+    regionLayer.syncViewportBounds();
     maskBrushPreview?.setViewportScale(viewportScale);
   };
+
+  function resolveViewportBounds() {
+    if (!mediaScene || viewportScale <= 0) return undefined;
+    return {
+      x: -mediaScene.x / viewportScale,
+      y: -mediaScene.y / viewportScale,
+      width: app.renderer.screen.width / viewportScale,
+      height: app.renderer.screen.height / viewportScale,
+    };
+  }
 
   const mediaPointToScreen = (point: Point): Point => {
     const fit = baseFit ?? { scale: 1, x: 0, y: 0 };
@@ -993,6 +1101,7 @@ export async function createPixiMediaScene(
       syncPresentationBox();
       updateMediaSceneFit();
       syncDisplaySizing();
+      drawInteractionPresentationLayer(currentMediaTime);
       renderOnChange();
     },
   );
@@ -1012,8 +1121,7 @@ export async function createPixiMediaScene(
 
   let unsubscribeDetectionTimeline: (() => void) | undefined;
 
-  if (frameChannel) {
-    frameChannel.onPresentedFrame(handlePresentedFrame);
+  if (rendersOnChange) {
     document.addEventListener?.("visibilitychange", handleVisibilityChange);
     // A detection load landing moves what the window covers exactly as a cook
     // landing does. Nothing else brings that to a resting playhead: the layers
@@ -1021,7 +1129,11 @@ export async function createPixiMediaScene(
     unsubscribeDetectionTimeline = options.detectionTimeline.subscribe?.(
       handlePreparedWindowChange,
     );
-  } else {
+  }
+
+  if (frameChannel) {
+    frameChannel.onPresentedFrame(handlePresentedFrame);
+  } else if (!stillFrame) {
     app.ticker.add(updateMediaSceneFit);
     app.ticker.add(drawAnnotationOverlayNow);
     app.ticker.add(tickFocusLayer);
@@ -1110,7 +1222,9 @@ export async function createPixiMediaScene(
     advanceFocus: () => undefined,
     drawAnnotationOverlay: frameChannel
       ? presentLayers.drawAnnotationOverlay
-      : () => undefined,
+      : stillFrame
+        ? (mediaTime) => drawAnnotationOverlay(mediaTime, overlayNow())
+        : () => undefined,
   };
 
   // A viewport-style redraw covers the layers whose geometry is a function of
@@ -1170,7 +1284,7 @@ export async function createPixiMediaScene(
 
   return {
     getRenderCount() {
-      return frameChannel ? renderScheduler.getRenderCount() : null;
+      return rendersOnChange ? renderScheduler.getRenderCount() : null;
     },
 
     getPreparedAnnotationWindow() {
@@ -1254,6 +1368,9 @@ export async function createPixiMediaScene(
           ? interactionDisplay
           : undefined,
       );
+      interactionLabelSlot.setDisplay(
+        interactionPresentationLayer?.getLabelDisplay() ?? undefined,
+      );
       attachFocusLayerDisplay();
       attachMaskLayerDisplay();
       attachLabelLayerDisplay();
@@ -1270,6 +1387,7 @@ export async function createPixiMediaScene(
     setPlaybackActive(active) {
       isPlaybackActive = active;
       maskLayer?.setPlaybackActive(active);
+      polygonLayer?.setPlaybackActive(active);
       depthSource?.setPlaybackActive?.(active);
     },
 
@@ -1299,6 +1417,7 @@ export async function createPixiMediaScene(
         if (!collectFrameTimings) {
           sample.draw(stagingContext, 0, 0, mediaWidth, mediaHeight);
           presentedSampleTimestamp = sample.timestamp;
+          refreshInspectionImage();
           stagingTextureSource?.update();
           stagingTexture?.update();
 
@@ -1307,6 +1426,7 @@ export async function createPixiMediaScene(
             sample.timestamp,
           );
           updateMediaSceneFit();
+          renderOnChange();
 
           return {
             ...createPresentedSampleState(
@@ -1323,6 +1443,7 @@ export async function createPixiMediaScene(
         const mediaUploadMs = measure(() => {
           sample.draw(stagingContext, 0, 0, mediaWidth, mediaHeight);
           presentedSampleTimestamp = sample.timestamp;
+          refreshInspectionImage();
           stagingTextureSource?.update();
           stagingTexture?.update();
         });
@@ -1331,6 +1452,7 @@ export async function createPixiMediaScene(
           sample.timestamp,
         );
         const fitMs = measure(updateMediaSceneFit);
+        renderOnChange();
 
         return {
           ...createPresentedSampleState(
@@ -1400,19 +1522,38 @@ export async function createPixiMediaScene(
       syncPresentationBox();
       updateMediaSceneFit();
       syncDisplaySizing();
+      drawInteractionPresentationLayer(currentMediaTime);
       renderOnChange();
     },
 
     setDisplayAdjustments(adjustments) {
       void import("pixi.js").then(({ ColorMatrixFilter }) => {
+        if (isDestroyed) return;
         const brightness = adjustments.brightness ?? 1;
         const contrast = adjustments.contrast ?? 1;
         const filter = new ColorMatrixFilter();
         // Preserve the renderer's pixel grid through the adjustment pass.
         filter.resolution = "inherit";
         filter.brightness(brightness, false);
-        filter.contrast(contrast - 1, true);
-        if (mediaSprite) mediaSprite.filters = [filter];
+        displayGamma = adjustments.gamma ?? 1;
+        displayAutoContrast = stillFrame && adjustments.autoContrast === true;
+        filter.contrast(displayAutoContrast ? 0 : contrast - 1, true);
+        if (mediaSprite) {
+          if (displayGamma !== 1 || displayAutoContrast) {
+            inspectionFilter ??= createPixiMediaInspectionFilter(
+              mediaSprite,
+              pixi,
+            );
+            inspectionFilter.update(
+              displayGamma,
+              displayAutoContrast,
+              hasPresentedSample ? stagingCanvas : null,
+            );
+            mediaSprite.filters = [inspectionFilter.filter, filter];
+          } else {
+            mediaSprite.filters = [filter];
+          }
+        }
         displayBrightness = brightness;
         displayContrast = contrast;
         renderOnChange();
@@ -1528,6 +1669,14 @@ export async function createPixiMediaScene(
     setPresentation(presentation, mediaTime) {
       appliedPresentation = presentation;
       currentMediaTime = mediaTime;
+      if (
+        annotationAntialiasing !==
+        (presentation.annotationAntialiasing ?? false)
+      ) {
+        annotationAntialiasing = presentation.annotationAntialiasing ?? false;
+        syncAnnotationAntialiasResolution();
+        syncSceneChildren();
+      }
       if (presentation.backgroundColor !== undefined) {
         app.renderer.background.color = presentation.backgroundColor;
         applyBackdropColor(backdrop, presentation.backgroundColor);
@@ -1787,6 +1936,11 @@ export async function createPixiMediaScene(
       // a decoder buffer in a producer that outlives the scene.
       frameChannel?.onPresentedFrame((presented) => presented.frame.close());
       destroyBatchTextureBindings();
+      destroyFilterBindings();
+      labelLayer?.setBackgroundAntialiasFilter(null);
+      interactionPresentationLayer?.setBackgroundAntialiasFilter(null);
+      annotationAntialiasLayer.destroy();
+      inspectionFilter?.destroy();
       mediaCompositor?.destroy();
       interactionLayer?.destroy();
       interactionPresentationLayer?.destroy();
@@ -1923,7 +2077,8 @@ export async function createPixiMediaScene(
         resolveInstructions: resolveArtifactMaskInstructions,
       });
 
-      if (rasterDisplay) maskLayer.setRasterDisplay(rasterDisplay);
+      syncMaskRasterDisplay();
+      maskLayer.setViewportScale(viewportScale);
 
       maskLayer.setPlaybackActive(isPlaybackActive);
 
@@ -2269,6 +2424,9 @@ export async function createPixiMediaScene(
         renderPreparation: options.renderPreparation,
         resolveContextState,
       });
+      polygonLayer.setPlaybackActive(isPlaybackActive);
+      syncMaskRasterDisplay();
+      polygonLayer.setViewportScale(viewportScale);
 
       if (timelineContext) {
         polygonLayer.setTimelineContext(timelineContext);
@@ -2323,14 +2481,19 @@ export async function createPixiMediaScene(
   ) {
     if (!focusLayer) {
       focusLayer = createPixiFocusLayer({
+        AlphaMask,
         Container,
         Graphics,
         ImageSource,
         Mesh,
         MeshGeometry,
+        Rectangle,
         Shader,
         UniformGroup,
         focusStyle,
+        getHeatmapRenderers: () => currentHeatmapRenderers,
+        getAnnotationAntialiasing: () => Boolean(annotationAntialiasing),
+        getViewportBounds: resolveViewportBounds,
         isDetectionVisible: (detection) =>
           !resolveAnnotationStyleState(detection, currentVisibility).hidden,
       });
@@ -2393,6 +2556,7 @@ export async function createPixiMediaScene(
 
     focusLayer.drawFrame({
       frame,
+      heatmapArtifacts: heatmapLayer?.getActiveFocusArtifacts(frame) ?? [],
       hoveredPick: withEditingPreview(
         filterVisiblePick(interactionState?.hoveredPick ?? null),
       ),
@@ -2439,6 +2603,9 @@ export async function createPixiMediaScene(
       mediaTime,
       selectedPick: interactionState?.selectedPick ?? null,
       selectedPicks: interactionState?.selectedPicks,
+      strokePixelRatio: annotationAntialiasing
+        ? annotationAntialiasResolution
+        : presentationResolution,
       viewportScale,
     });
   }
@@ -2471,7 +2638,7 @@ export async function createPixiMediaScene(
 
     const { boxState, regionState } = drawAnnotationFrame(currentMediaTime);
 
-    if (frameChannel) {
+    if (rendersOnChange) {
       const signature = describeSceneRender();
       if (forceRender) renderScheduler.render(signature);
       else if (!renderScheduler.renderOnChange(signature)) return;
@@ -2542,13 +2709,13 @@ export async function createPixiMediaScene(
     const frame = annotationDetectionTimeline.selectFrame(mediaTime);
     const interactionState = interactionLayer?.getState();
     const editingState = options.editingEngine?.getState();
-    labelLayer?.drawCreationPreview(
-      editingState?.kind === AnnotationGestureStateKind.Creating
-        ? editingState.preview
-        : null,
-      mediaTime,
-      viewportScale,
-    );
+    const previewOverlay = options.previewOverlay?.() ?? null;
+    drawnEditingState = editingState;
+    // Only a scene that renders on change compares signatures.
+    if (rendersOnChange) {
+      drawnPreviewOverlayContent =
+        describePreviewOverlayContent(previewOverlay);
+    }
     annotationOverlayLayer.draw({
       frame,
       marquee: interactionState?.marqueeRect ?? null,
@@ -2556,19 +2723,41 @@ export async function createPixiMediaScene(
       mediaWidth,
       now: overlayNowMs,
       pointer: interactionState?.pointerPoint ?? null,
-      previewOverlay: options.previewOverlay?.() ?? null,
+      previewOverlay,
       selectedDetectionIds: (interactionState?.selectedPicks ?? []).flatMap(
         ({ detection }) => (detection.id === undefined ? [] : [detection.id]),
       ),
       viewportScale,
       visibility: currentVisibility,
     });
+    const editingBox = annotationOverlayLayer.getRenderedEditingBox();
+    const creationPreview =
+      editingState?.kind === AnnotationGestureStateKind.Creating
+        ? editingState.preview
+        : null;
+    labelLayer?.drawCreationPreview(
+      creationPreview,
+      mediaTime,
+      viewportScale,
+      editingBox && editingBox.detection === creationPreview
+        ? editingBox.rect
+        : undefined,
+    );
+    if (editingState?.activeDetectionId != null) {
+      labelLayer?.updateEditingBox(
+        editingState.activeDetectionId,
+        editingBox?.detection.id === editingState.activeDetectionId
+          ? editingBox.rect
+          : undefined,
+      );
+    }
   }
 
   /**
    * Milliseconds for animations that are not annotation geometry. A pull scene
-   * has a ticker and reads the wall clock; a push scene has the presented media
-   * time and nothing else, so its animations move only when the media does.
+   * has a ticker and reads the wall clock, as does a still frame while its
+   * ticker runs; a push scene has the presented media time and nothing else,
+   * so its animations move only when the media does.
    */
   function overlayNow() {
     return frameChannel ? currentMediaTime * MILLISECONDS_PER_SECOND : now();
@@ -2626,7 +2815,21 @@ export async function createPixiMediaScene(
   }
 
   function renderScene() {
+    drawOverlayForEditingState();
     renderScheduler.render(describeSceneRender());
+  }
+
+  /**
+   * The render signature names the editing state, so a render must not record
+   * a state the overlay has not drawn: the redraw that follows would match the
+   * recorded signature and be skipped, leaving the old preview on screen.
+   */
+  function drawOverlayForEditingState() {
+    const editingState = options.editingEngine?.getState();
+    if (editingState === undefined || editingState === drawnEditingState) {
+      return;
+    }
+    drawAnnotationOverlay(currentMediaTime, overlayNow());
   }
 
   /**
@@ -2659,14 +2862,53 @@ export async function createPixiMediaScene(
   }
 
   function renderNow() {
-    if (frameChannel) renderScene();
+    if (rendersOnChange) renderScene();
   }
 
   function renderOnChange() {
-    if (!frameChannel) return;
+    if (!rendersOnChange) return;
 
     settleFocusAnimation();
+    drawOverlayForEditingState();
     renderScheduler.renderOnChange(describeSceneRender());
+  }
+
+  /**
+   * Runs the ticker on a still frame for as long as something on it moves by
+   * the clock: a looping GIF region or a loading spinner. Pixi renders on
+   * every tick it runs, and the overlay redraws so the spinner turns. Each
+   * render checks again, so the ticker stops with the render that removes the
+   * last of them.
+   */
+  function syncStillFrameTicker() {
+    if (!stillFrame || isDestroyed) return;
+
+    const animating =
+      hasPresentedSample &&
+      (regionLayer.hasAnimatedDisplay() || hasLoadingDetections());
+
+    if (animating === stillFrameTickerRunning) return;
+    stillFrameTickerRunning = animating;
+
+    if (animating) {
+      app.ticker.add(drawAnnotationOverlayNow);
+      app.ticker.start();
+    } else {
+      app.ticker.stop();
+      app.ticker.remove(drawAnnotationOverlayNow);
+    }
+  }
+
+  function refreshInspectionImage() {
+    if (!stillFrame || !inspectionFilter) return;
+    inspectionFilter.invalidateImage();
+    inspectionFilter.update(displayGamma, displayAutoContrast, stagingCanvas);
+  }
+
+  function hasLoadingDetections() {
+    const loading = currentVisibility?.loadingDetectionIds;
+    if (!loading) return false;
+    return "size" in loading ? loading.size > 0 : loading.length > 0;
   }
 
   /**
@@ -2695,6 +2937,8 @@ export async function createPixiMediaScene(
       app.renderer.resolution,
       displayBrightness,
       displayContrast,
+      displayGamma,
+      displayAutoContrast,
       ...RENDERED_PRESENTATION_FIELDS.map(
         (field) => appliedPresentation?.[field],
       ),
@@ -2709,6 +2953,9 @@ export async function createPixiMediaScene(
       interactionState?.marqueeRect,
       options.editingEngine?.getState(),
       options.editingEngine ? interactionState?.pointerPoint : null,
+      // The host's preview is read when the overlay draws, and a host may edit
+      // its arrays in place, so its content is what tells a redraw it changed.
+      drawnPreviewOverlayContent,
     ];
   }
 
@@ -2806,6 +3053,7 @@ export async function createPixiMediaScene(
         Text,
         detectionTimeline: annotationDetectionTimeline,
         labelStyle,
+        getRenderedBoxes: () => boxLayer.getRenderedBoxes(),
         resolveContextState: resolveLabelContextState,
       });
     }
@@ -3152,6 +3400,41 @@ function elapsedSince(start: number) {
 
 function now() {
   return globalThis.performance?.now?.() ?? Date.now();
+}
+
+/**
+ * A key for what a preview overlay draws, hashed from its coordinates rather
+ * than its arrays, so a preview the host edits in place still changes it.
+ * Coordinates count to a 256th of a media pixel, finer than anything drawn.
+ */
+function describePreviewOverlayContent(
+  overlay: PreviewOverlayData | null,
+): number | null {
+  if (!overlay) return null;
+
+  let hash = 0x811c9dc5;
+  const mix = (value: number) => {
+    hash = Math.imul(hash ^ value, 0x01000193);
+  };
+  const mixPoint = (point: Point) => {
+    mix(Math.round(point.x * 256));
+    mix(Math.round(point.y * 256));
+  };
+
+  for (const polygons of [overlay.hoverPolygons, overlay.draftPolygons]) {
+    mix(polygons?.length ?? -1);
+    for (const polygon of polygons ?? []) {
+      mix(polygon.length);
+      for (const point of polygon) mixPoint(point);
+    }
+  }
+  mix(overlay.points?.length ?? -1);
+  for (const point of overlay.points ?? []) {
+    mixPoint(point);
+    mix(point.positive ? 1 : 0);
+  }
+
+  return hash;
 }
 
 /**

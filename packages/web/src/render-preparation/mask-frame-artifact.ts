@@ -1,3 +1,5 @@
+import type { StrokeAlignment } from "supervision-js-core";
+
 export enum PreparedMaskFrameKind {
   IdMask = "idMask",
   RgbaImage = "rgbaImage",
@@ -63,12 +65,15 @@ export interface PreparedIdMaskFrame {
   readonly height: number;
   readonly key: string;
   readonly kind: PreparedMaskFrameKind.IdMask;
+  /** Largest outside stroke extent in CSS pixels. */
   readonly maxStrokeWidth: number;
   readonly raster: Uint8Array<ArrayBuffer>;
   readonly regionMaskCoverage?: PreparedRegionMaskCoverageFrame;
-  /** The frame-wide mask width every stroke on this raster is scaled against. */
+  /** Original mask-plane width before optional raster reduction. */
   readonly sourceWidth: number;
   readonly strokePalette: Float32Array<ArrayBuffer>;
+  readonly strokeAlignments?: Float32Array<ArrayBuffer>;
+  /** Total stroke width in CSS pixels per palette ID. */
   readonly strokeWidths: Float32Array<ArrayBuffer>;
   readonly width: number;
   close(): void;
@@ -79,6 +84,8 @@ export interface PreparedMaskScreenStroke {
   readonly color: number;
   readonly alpha: number;
   readonly width: number;
+  readonly widthUnit?: "mask" | "screen";
+  readonly alignment?: StrokeAlignment;
   /** Closed contours in this artifact's raster coordinates, including holes. */
   readonly paths: readonly Float32Array<ArrayBuffer>[];
 }

@@ -259,6 +259,7 @@ export {
   writeIdMaskPaletteEntry,
   type IdMaskFrame,
   type IdMaskInstruction,
+  type IdPolygonInstruction,
 } from "#utils/id-mask-frame";
 export {
   resolveEllipseSegmentCount,
@@ -425,6 +426,7 @@ export {
   MediaSourceStatus,
 } from "#types/media-rendering";
 export type {
+  AnnotationAntialiasing,
   MediaFrameDiagnostics,
   MediaFrameRenderTimings,
   MediaRendererDiagnosticsOptions,
